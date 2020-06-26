@@ -1,0 +1,29 @@
+---
+title: "Outlier detection in vowel trajectory data using DOBIN"
+author: "Joey Stanley"
+date: "8/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Outlier Detection
+
+I can't claim to know everything about outlier detection. I know there are tons of different ways to do it, each one with its own strengths and weaknesses. Based on what little I do know, I'll bet there are statisticians that spend their careers studying outlier detection.
+
+In linguistics, particularly when looking at vowel formant data, I've seen a handful of techniques being used to detect (and consequently remove) outliers. One common way is to remove points two standard deviations from the mean for both F1 and F2, per vowel, per speaker. Another way is to use the Mahalanobis distance. I've even tried to come up with a technique of my own, but it's not quite finished yet. I'm not thrilled about either of these techniques, especially the *z*-score one, but that'll have to wait for a different blog post. 
+
+To complicate things, there seems to be a trend towards analyzing vowel *trajectories* rather than midpoints. That is, you analyze formant measurements from more than one time point per token. FAVE has made this easy since it gives us five F1 and F2 measurements per vowel anyway. My dissertation uses 11 points per vowel. I've seen others use as many as 100. 
+
+What remains unclear is how to detect outliers on vowel trajectory data. Do you perform the same technique on each timepoint individually? Do you pool them all together and run the analysis that way? Say you find that the 35% point of one vowel token is an outlier: do you throw out the entire token or exclude just that the one measurement? 
+
+I don't really have answers to these questions, but they are questions we need to be asking. However, I recently came across a new process called DOBIN that may help with these questions in high-dimensional data like what we have with vowel trajectories. 
+
+## What is DOBIN?
+
+
+
+
+

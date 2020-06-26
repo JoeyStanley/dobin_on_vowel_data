@@ -1,0 +1,438 @@
+---
+title: "sandbox"
+author: "Joey Stanley"
+date: "8/24/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro
+
+I recently came across [this](https://robjhyndman.com/papers/dobin.pdf) paper on Andrew Gelman's blog. It introduces a technique called DOBIN that aids in the detection of outliers. Because many linguists rely on automatic methods, we often have to detect outliers. There are a variety of methods out there, none of which I've been completely satisfied with. So, I thought I'd try using DOBIN on vowel data.
+
+The overall conclusion is not particularly satisfiying since it's not clear whether this is any better than our existing techniques in linguistics. In this post, I do present all the code I use, so you're free to follow along. However, I wrote this more of a meander through R code rather than a tutorial.
+
+```{r}
+library(tidyverse)
+```
+
+# Read in data
+
+First, I'll read in some data. This is a dataset I use a lot in my tutorials and it's me reading about 300 sentences in my kitchen. It was automatically transcribed, force-aligned, and formant-extracted using [DARLA](http://darla.dartmouth.edu), so there's bound to be some outliers in there. It makes for a great dataset to practice DOBIN in. For simplicity, I'll just focus on my /i/ vowel before obstruents. And since I'll have to reshape the data a little bit, I'll add the `id` column using `rowid_to_column()` to make reshaping a little easier.
+
+```{r}
+iy <- read.csv("http://joeystanley.com/data/joey.csv") %>%
+  filter(vowel == "IY",
+         stress == 1,
+         plt_manner %in% c("stop", "fricative", "affricate")) %>%
+  select(vowel, word, F1.20.:F2.80.) %>%
+  rowid_to_column("id") %>%
+  print()
+```
+
+
+```{r}
+iy %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  ggplot(aes(percent, hz, group = traj_id, color = formant)) + 
+  geom_path() +
+  ggthemes::scale_color_ptol() + 
+  theme_classic()
+```
+
+
+# Get DOBIN working
+
+```{r}
+#devtools::install_github("sevvandi/dobin")
+library(dobin)
+```
+
+
+```{r}
+set.seed(1)
+# A bimodal distribution in six dimensions, with 5 outliers in the middle.
+X <- data.frame(
+   x1 = c(rnorm(400,mean=5), rnorm(5, mean=0, sd=0.2), rnorm(400, mean=-5)),
+   x2 = rnorm(805),
+   x3 = rnorm(805),
+   x4 = rnorm(805),
+   x5 = rnorm(805),
+   x6 = rnorm(805)
+)
+labs <- c(rep(0,400), rep(1,5), rep(0,400))
+out <- dobin(X)
+plot(out$coords[ , 1:2], col=as.factor(labs), pch=20)
+```
+
+# Okay now try it on mine
+
+```{r}
+dobin_output <- dobin(iy[,4:13])
+dobin_coords <- dobin_output$coords %>%
+  as_tibble() %>%
+  print()
+ggplot(dobin_coords, aes(V1, V2)) + 
+  geom_point()
+```
+
+Okay, so it seems to work. It does some dimension reduction stuff (similar to PCA if I recall correctly). 129 observations rescaled to 10 new variables. I think they line up with the original 129 observations, so I'll add it back on and see what I find.
+
+```{r}
+iy_tall <- iy %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  arrange(id) %>%
+  print()
+  
+dobin_tall <- dobin_coords %>%
+  rowid_to_column("id") %>%
+  gather(V, value, -id) %>%
+  arrange(id, V) %>%
+  print()
+
+
+iy_with_dobin <- iy %>%
+  bind_cols(dobin_coords) %>%
+  gather(measure, value, -id, -vowel, -word) %>%
+  mutate(measurement_type = if_else(str_starts(measure, "F"), "formant", "dobin")) %>%
+  arrange(id) %>%
+  print()
+
+iy_tall %>%
+  left_join(rowid_to_column(dobin_coords, "id")) %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  print() %>%
+  ggplot(aes(percent, hz, group = traj_id, color = V1)) + 
+  geom_path() +
+  scico::scale_color_scico(palette = "nuuk") +
+  theme_dark()
+```
+
+Okay, so it took a second, but I've realized that this will identify whether *entire tokens* are outliers, rather than individual measurements from those tokens. Interesting. It seems like it does a pretty good job.
+
+```{r}
+iy_tall %>%
+  left_join(rowid_to_column(dobin_coords, "id")) %>%
+  spread(formant, hz) %>%
+  print() %>%
+  ggplot(aes(F2, F1, group = id, color = V1)) + 
+  geom_path() + 
+  scale_x_reverse() + scale_y_reverse() + 
+  scico::scale_color_scico(palette = "nuuk") +
+  theme_dark()
+```
+
+Skimming through the paper, it looks like there are ways to tell *which variables* made a particular token an outlier. That's cool.
+
+## Remove outliers using this space
+
+Okay, so I just reread the paper, it's clearer now that DOBIN is meant to act as a way to prepare the data for some other outlier detection procedure. In my mind it's similar to PCA and then doing outlier detection on PCA, but it sounds like it's not the same math at all. I tried to follow the math, but I couldn't. The point is from here I need to take the DOBIN output, keep the first half of the components, and then do some sort of outlier detection from there. In the article they used LOF, KNN, and iForest. I know what KNN is but I don't know the others. I wonder if I should learn about those. For now, let me just try Mahalanobis distance, since it works on multivariate data.
+
+### Mahalanobis Distance
+
+Do a simple mahalanobis distance. Man, I love that function I wrote!
+
+```{r}
+iy_mahal <- iy %>%
+  left_join(rowid_to_column(dobin_coords, "id"), by = "id") %>%
+  mutate(mahal_dist = joeyr::tidy_mahalanobis(V1, V2, V3, V4, V5)) %>%
+  print()
+```
+
+Check out the distribution:
+
+```{r}
+ggplot(iy_mahal, aes(mahal_dist)) + 
+  geom_density()
+```
+
+Yeah there are some clear outliers. 
+
+So, Dr. Renwick does some 95% chi-square stuff. But it basically chops off the furthest 5%. I'll just label them as outliers so I can plot them.
+
+```{r}
+iy_mahal_outlier <- iy_mahal %>%
+  arrange(mahal_dist) %>%
+  rowid_to_column("mahal_rank") %>%
+  mutate(mahal_percentile = mahal_rank/max(mahal_rank),
+         is_outlier = mahal_percentile >= 0.95) %>%
+  select(-starts_with("mahal")) %>%
+  print()
+```
+
+Now plot them:
+
+```{r}
+iy_mahal_outlier %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  ggplot(aes(percent, hz, group = traj_id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() +
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + Mahalanobis")
+
+iy_mahal_outlier %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  spread(formant, hz) %>%
+  ggplot(aes(F2, F1, group = id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() + 
+  scale_x_reverse() + scale_y_reverse() + 
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + Mahalanobis")
+```
+
+So, with this technique, which tokens are outliers?
+
+```{r}
+mahal_outliers <- iy_mahal_outlier %>%
+  filter(is_outlier) %>%
+  pull(id) %>%
+  print()
+```
+
+
+
+### K-nearest Neighbor
+
+Following the very simple code here: https://rdrr.io/cran/adamethods/man/do_knno.html
+```{r}
+#install.packages("adamethods")
+library(adamethods)
+```
+
+So first, let me try it on the raw data.
+
+```{r}
+iy_knn <- do_knno(iy[,4:13], k = 5, top_n = 7)
+iy_knn
+```
+
+Oh, okay, so just like that, this method tells me which points are considered outliers. That was quick. Okay, so now let me try it on the DOBIN output.
+
+```{r}
+iy_dobin_knn <- iy %>%
+  left_join(rowid_to_column(dobin_coords, "id"), by = "id") %>%
+  select(V1:V5) %>%
+  do_knno(., k = 5, top_n = 7)
+iy_dobin_knn
+```
+
+Similar as the raw ones, but not entirely the same list (or in the same order).
+
+```{r}
+iy %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  mutate(is_outlier = id %in% iy_dobin_knn) %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  ggplot(aes(percent, hz, group = traj_id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() +
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + KNN")
+
+iy %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  spread(formant, hz) %>%
+  mutate(is_outlier = id %in% iy_dobin_knn) %>%
+  ggplot(aes(F2, F1, group = id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() + 
+  scale_x_reverse() + scale_y_reverse() + 
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + KNN")
+```
+
+### LOF
+
+According to [this](https://rpubs.com/maulikpatel/228336), LOF is Local Outlier Factor: Proximity (density) Based Outlier Detection Technique
+
+```{r}
+# install.packages("DMwR")
+library(DMwR)
+```
+
+```{r}
+iy_lof <- iy %>%
+  select(F1.20.:F2.80.) %>%
+  lofactor(k = 5)
+```
+
+I'll again take out the worst 5%.
+
+```{r}
+iy_with_lof <- iy %>%
+  add_column(lof = iy_lof) %>%
+  arrange(lof) %>%
+  rowid_to_column("lof_rank") %>%
+  mutate(lof_percentile = lof_rank/max(lof_rank),
+         is_outlier = lof_percentile >= 0.95) %>%
+  select(-lof_rank, lof_percentile) %>%
+  print()
+```
+
+```{r}
+iy_with_lof %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  ggplot(aes(percent, hz, group = traj_id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() +
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + LOF")
+
+iy_with_lof %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  spread(formant, hz) %>%
+  ggplot(aes(F2, F1, group = id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() + 
+  scale_x_reverse() + scale_y_reverse() + 
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + LOF")
+```
+
+```{r}
+lof_outliers <- iy_with_lof %>%
+  filter(is_outlier) %>%
+  pull(id) %>%
+  print()
+```
+
+### With Isolateion Forest
+
+Following this [post](https://www.kaggle.com/norealityshows/outlier-detection-with-isolation-forest-in-r).
+
+```{r}
+#install.packages("solitude")
+library(solitude)
+```
+
+
+This more or less follows the function's example code.
+
+```{r}
+index <- sample(ceiling(nrow(iy) * 0.2))
+iy_iforest <- solitude::isolationForest$new()
+iy_iforest$fit(iy[index,4:13])
+iy_iforest$scores
+
+plot(density(iy_iforest$scores$anomaly_score))
+round(head(sort(iy_iforest$scores$anomaly_score, dec = TRUE), 20), 2)
+
+iy_iforest$predict(iy[-index,4:13]) # scores for new data
+```
+
+But I can't figure out how to extract the predicted values. So I'll rerun it on 100% of the data.
+
+```{r}
+iy_iforest <- solitude::isolationForest$new()
+iy_iforest$fit(iy[,4:13])
+iy_iforest$scores
+
+iy_with_iforest <- iy %>%
+  add_column(iforest = iy_iforest$scores$anomaly_score) %>%
+  arrange(iforest) %>%
+  rowid_to_column("iforest_rank") %>%
+  mutate(iforest_percentile = iforest_rank/max(iforest_rank),
+         is_outlier = iforest_percentile >= 0.95) %>%
+  select(-iforest_rank, iforest_percentile) %>%
+  print()
+```
+
+```{r}
+iy_with_iforest %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  unite(traj_id, formant, id, remove = FALSE) %>%
+  ggplot(aes(percent, hz, group = traj_id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() +
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + iForest")
+
+iy_with_iforest %>%
+  gather(formant_percent, hz, starts_with("F")) %>%
+  separate(formant_percent, c("formant", "percent"), extra = "drop") %>%
+  spread(formant, hz) %>%
+  ggplot(aes(F2, F1, group = id, color = is_outlier, alpha = is_outlier)) + 
+  geom_path() + 
+  scale_x_reverse() + scale_y_reverse() + 
+  scale_color_manual(values = c("gray60", "red")) + 
+  scale_alpha_manual(values = c(0.5, 1)) + 
+  theme_classic() + 
+  labs(title = "Outliers as determined by DOBIN + iForest")
+```
+
+So which ones were outliers?
+
+```{r}
+iforest_outliers <- iy_with_iforest %>%
+  filter(is_outlier) %>%
+  pull(id) %>%
+  print()
+```
+
+### Summary
+
+So, based on these four methods, here were the outliers:
+
+```{r}
+mahal_outliers
+iy_dobin_knn
+lof_outliers
+iforest_outliers
+```
+
+Because why not, here's a visual:
+
+```{r, fig.width = 3, fig.height = 5}
+tibble(id = 1:129) %>%
+  mutate(mahal   = id %in% mahal_outliers,
+         knn     = id %in% iy_dobin_knn,
+         lof     = id %in% lof_outliers,
+         iforest = id %in% iforest_outliers,
+         n_removed = mahal + knn + lof + iforest,
+         id = factor(id)) %>%
+  
+  # Ignore all those that weren't detected.
+  filter(n_removed > 0) %>%
+  arrange(-n_removed) %>%
+  # mutate(id = fct_inorder(id)) %>%
+  select(-n_removed) %>%
+  
+  # Make tall
+  gather(method, is_outlier, -id) %>%
+  mutate(method = factor(method, levels = c("mahal", "knn", "iforest", "lof"))) %>%
+  
+  ggplot(aes(method, id, fill = is_outlier)) + 
+  geom_tile() + 
+  scale_fill_manual(values = c("gray60", "red")) +
+  theme_classic()
+```
+
+Okay, so only two tokens were removed by all four methods. None were removed by 3. Of the remaining about half were with two methods and half with one. Each method produced one unique one. It definitely looks like maybe iForest and LOF were more similar to each other, and mahal and KNN were more similar to each other. This doens't bade well because the choice of which method to use will determine which tokens are considered outliers. 
+
+Furthermore, in all of these, I had to specify how many outliers I was interested in. I did 5% because it's probably pretty typical, but looking at the data, It looks like more than that were bad. So, what I want to have done is like what I'm trying to do in my Modified Mahalanobis Distance, where it continues to remove points until it looks good. The problem is when to tell if things look good. If you've got a lot of bad data, the algorithm will thing tha bad data is good. 
+
+I guess the test from here is to see whether these same points would be removed if I had done these four prodedures on the raw Hz data. 
